@@ -20,9 +20,8 @@ AscensionRaidRolls is a shared timed raid-roll tracker for Project Ascension's C
 ## Installation
 
 1. Download the latest ZIP from [GitHub Releases](https://github.com/LaSainteChips/AscensionRaidRolls/releases).
-2. Extract it into `World of Warcraft/Interface/AddOns/`.
-3. Confirm the resulting path is `Interface/AddOns/AscensionRaidRolls/AscensionRaidRolls.toc`.
-4. Restart the client or use `/reload`.
+2. Extract it into `Ascension\Launcher\resources\ascension-live\Interface\AddOns`.
+3. Restart the client or use `/reload`.
 
 ## Commands
 
