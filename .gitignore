@@ -1,0 +1,14 @@
+# Local Codex workspace artifacts
+work/
+outputs/
+
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Packaged releases
+*.zip
+

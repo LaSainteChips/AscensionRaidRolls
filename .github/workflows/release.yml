@@ -1,0 +1,39 @@
+name: Release addon
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate tag and addon version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          grep -Fxq "## Version: ${tag_version}" AscensionRaidRolls/AscensionRaidRolls.toc
+          test -f AscensionRaidRolls/AscensionRaidRolls.lua
+
+      - name: Build addon ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="AscensionRaidRolls-${GITHUB_REF_NAME}.zip"
+          zip -r "$archive" AscensionRaidRolls \
+            -x "AscensionRaidRolls/README.txt"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AscensionRaidRolls-${{ github.ref_name }}.zip
+          generate_release_notes: true
+
