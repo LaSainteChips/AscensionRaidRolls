@@ -29,17 +29,6 @@ AscensionRaidRolls is a shared timed raid-roll tracker for Project Ascension's C
 ## Commands
 
 - `/rr` — show or hide the main window.
-- `/rr ms` — roll MS (1–100).
-- `/rr os` — roll OS (1–99).
-- `/rr start` — start a timed roll when permitted.
-- `/rr reset` — reset the shared session or local log when permitted.
-- `/rr duration <seconds>` — set the timer from 5 to 300 seconds.
-- `/rr tie` — start a tie-break for the selected tied group.
-- `/rr trade` — announce and trade to the selected winner.
-- `/rr ml <@ME|PlayerName>` — set the automatic Master Loot recipient.
-- `/rr autoloot <on|off>` — control automatic Master Loot assignment.
-- `/rr version` — show the installed and newest observed versions.
-- `/rr debug` — print diagnostic information, including Top X inventory scans.
 
 ## Compatibility
 
