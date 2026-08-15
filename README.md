@@ -17,6 +17,9 @@ AscensionRaidRolls is a shared timed raid-roll tracker for Project Ascension's C
 - Movable minimap button with a persistent position.
 - Raid/guild addon-message version exchange and update warnings.
 
+<img width="705" height="770" alt="AscensionRaidRolls" src="https://github.com/user-attachments/assets/5819de2d-7874-4da4-b488-d7fc68321cbb" />
+
+
 ## Installation
 
 1. Download the latest ZIP from [GitHub Releases](https://github.com/LaSainteChips/AscensionRaidRolls/releases).
