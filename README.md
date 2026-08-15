@@ -23,7 +23,7 @@ AscensionRaidRolls is a shared timed raid-roll tracker for Project Ascension's C
 ## Installation
 
 1. Download the latest ZIP from [GitHub Releases](https://github.com/LaSainteChips/AscensionRaidRolls/releases).
-2. Extract it into `Ascension\Launcher\resources\ascension-live\Interface\AddOns`.
+2. Extract it and put the folder named "AscensionRaidRolls" (and not the one finishing with -latest) "into `Ascension\Launcher\resources\ascension-live\Interface\AddOns`.
 <img width="949" height="332" alt="Installation" src="https://github.com/user-attachments/assets/8921c139-94eb-4be9-a246-2b383eb33ae5" />
 3. Restart the client or use `/reload`.
 
