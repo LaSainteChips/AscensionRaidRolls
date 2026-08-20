@@ -1,37 +1,33 @@
 # AscensionRaidRolls
 
-AscensionRaidRolls is a shared timed raid-roll tracker for Project Ascension's Conquest of Azeroth on the WoW 3.3.5a client.
+AscensionRaidRolls is a shared raid loot and roll manager for Project Ascension's Conquest of Azeroth on the WoW 3.3.5a client.
 
 ## Features
 
-- MS rolls use `/roll 100`; OS rolls use `/roll 99`.
-- The first normal roll counts. Later rolls remain visible and are marked as rerolls.
-- A Master Looter can run an authoritative session synchronized to addon-enabled raid viewers.
-- If the Master Looter does not use ARR, viewers retain local roll buttons and local roll tracking.
-- Outside a raid, standalone mode exposes the full workflow for testing.
-- Configurable roll timers with final five-second warnings.
-- Top X winner counts for temporarily tradable raid loot and eligible unbound BoE copies.
-- Manual tie-break rounds and manual winner selection.
-- Trade announces the selected winner, opens trade, and inserts the item without accepting the trade.
-- Optional automatic Master Loot assignment to `@ME` or a named player.
-- Movable minimap button with a persistent position.
+- Synchronized timed MS and OS roll sessions with viewer fallback and standalone testing.
+- Optional SR > MS > OS priority using BisBeard SoftRes/HardRes imports.
+- Multiple reservations of the same item with `1xSR`, `2xSR`, and reroll handling.
+- SoftRes roster checks, configurable reservation limits, reservation links, and raid reminders.
+- Optional synchronized MS/OS+1 tracking with separate MS and OS histories.
+- Top X rolls, tie breaks, manual winner selection, and winner trading.
+- Trade-expiration timers with color warnings and Master Looter alerts.
+- Optional automatic Master Loot assignment and winner-announcement muting.
 - Raid/guild addon-message version exchange and update warnings.
 
-<img width="350" height="375" alt="AscensionRaidRolls" src="https://github.com/user-attachments/assets/5819de2d-7874-4da4-b488-d7fc68321cbb" />
-
+See [CHANGELOG.md](CHANGELOG.md) for the complete 1.8.0 feature summary.
 
 ## Installation
 
-1. Download the latest ZIP from [GitHub Releases](https://github.com/LaSainteChips/AscensionRaidRolls/releases).
-2. Extract it and put the folder named "AscensionRaidRolls" (and not the one finishing with -latest) "into `Ascension\Launcher\resources\ascension-live\Interface\AddOns`.
-<img width="949" height="332" alt="Installation" src="https://github.com/user-attachments/assets/8921c139-94eb-4be9-a246-2b383eb33ae5" />
-3. Restart the client or use `/reload`.
+Download the latest ZIP from [GitHub Releases](https://github.com/LaSainteChips/AscensionRaidRolls/releases), extract `AscensionRaidRolls` into `Interface/AddOns/`, then restart the client or use `/reload`.
 
-## Commands
+## Update notifications
 
-- `/rr` — show or hide the main window.
+The 3.3.5a Lua sandbox cannot perform HTTP requests to GitHub. ARR therefore exchanges its embedded version number through WoW addon messages with other ARR users in your **raid and guild**. If another online player is running a newer release, older clients display an update warning.
 
-## Compatibility
+`/rr version` prints your installed version and the newest version observed during the current session.
 
-The addon targets Project Ascension/Conquest of Azeroth and the Ascension WoW 3.3.5a API. It is not designed around Retail WoW APIs.
+The GitHub Releases page remains the source of truth for downloads. Publishing a new release means bumping the `.toc` version and tagging the repository.
 
+## Source layout
+
+Version 1.8.0 uses an ordered modular layout while remaining independent from Gargul and compatible with WoW 3.3.5a. Bootstrap and version helpers live under `Core/`; Base64/JSON and synchronized reservation state live under `Features/SoftRes/`; the runtime coordinator lives under `Core/Runtime.lua`. See `AscensionRaidRolls/ARCHITECTURE.md` for module boundaries and compatibility rules.

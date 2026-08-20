@@ -2,7 +2,12 @@
 ## Title: Ascension Raid Rolls
 ## Notes: Shared timed raid roll tracker for Project Ascension with local fallback tracking when the Master Looter does not use the addon, integrated MS/OS buttons, winner trade, and optional automatic Master Loot distribution, synchronized Top X winner counts (temporary-trade loot + unbound BoE copies), tie-break handling, and unrestricted Standalone Mode outside raids.
 ## Author: LaSainteChips
-## Version: 1.7.4
+## Version: 1.8.0
 ## SavedVariables: AscensionRaidRollsDB
 
-AscensionRaidRolls.lua
+Core\Bootstrap.lua
+Core\Version.lua
+Features\SoftRes\State.lua
+Features\SoftRes\Codec.lua
+Features\TradeTimers\TradeTimers.lua
+Core\Runtime.lua

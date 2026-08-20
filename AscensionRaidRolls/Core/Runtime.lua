@@ -1,3 +1,5 @@
+-- Legacy runtime coordinator. New independent systems belong in dedicated
+-- Core, Features, Interface, or Utils modules and are loaded through the TOC.
 local ADDON_NAME = "AscensionRaidRolls"
 
 local rollsMS = {}
@@ -7,6 +9,7 @@ local firstRollByPlayer = {}
 local sequence = 0
 local mainFrame
 local quickRollFrame
+local optionsFrame
 local minimapButton
 local minimapDragging = false
 local MINIMAP_BUTTON_RADIUS = 80
@@ -15,6 +18,7 @@ local msPanel
 local osPanel
 local selectedRoll
 local UpdateUI
+local SetButtonEnabled
 local rollPattern
 local rollCaptureOrder
 local currentItemLink
@@ -23,6 +27,12 @@ local currentTopRolls = 1
 local pendingTradeItemLink
 local pendingTradeItemID
 local pendingTradePlayer
+local awardedPlayersForRoll = {}
+local currentRollAwardOrder = {}
+local syncedLootHistory = { MS = {}, OS = {} }
+local syncedPlusOneEnabled = false
+local syncedLootHistoryRevision = 0
+local pendingSyncedLootHistory = nil
 local autoMasterLootProcessing = false
 local autoMasterLootTarget
 local autoMasterLootAccumulator = 0
@@ -62,7 +72,7 @@ local MAX_ROLL_DURATION = 300
 -- addon messages and operate the main window in viewer mode.
 local SYNC_PREFIX = "ARRSYNC"
 local SYNC_PROTOCOL = 2
-local ADDON_VERSION = (GetAddOnMetadata and GetAddOnMetadata(ADDON_NAME, "Version")) or "1.7.4"
+local ADDON_VERSION = (GetAddOnMetadata and GetAddOnMetadata(ADDON_NAME, "Version")) or "1.8.0"
 local latestSeenVersion = ADDON_VERSION
 local notifiedNewerVersions = {}
 local syncSessionID = nil
@@ -76,6 +86,10 @@ local BroadcastRollSync
 local BroadcastSessionEnd
 local SendFullSyncState
 local IsRemoteSyncedSession
+local BroadcastLootHistory
+local BroadcastLootCount
+local UpdateOptionsControlState
+local IsInRaid
 
 local function Print(message)
     if DEFAULT_CHAT_FRAME then
@@ -112,8 +126,315 @@ local function IsSamePlayerName(a, b)
     return aKey ~= nil and bKey ~= nil and aKey == bKey
 end
 
-local function IsInRaid()
+local function ShouldUseSyncedLootHistory()
+    return IsInRaid()
+        and syncOwner ~= nil
+        and not IsSamePlayerName(syncOwner, UnitName("player"))
+end
+
+local function IsMSOSPlusOneEnabled()
+    if ShouldUseSyncedLootHistory() then
+        return syncedPlusOneEnabled == true
+    end
+    return AscensionRaidRollsDB and AscensionRaidRollsDB.msosPlusOneEnabled == true
+end
+
+local function GetActiveLootHistory()
+    if ShouldUseSyncedLootHistory() then
+        return syncedLootHistory
+    end
+    return AscensionRaidRollsDB and AscensionRaidRollsDB.lootHistory or nil
+end
+
+local function GetLootWinCount(name, rollType)
+    if not IsMSOSPlusOneEnabled() then
+        return 0
+    end
+
+    local playerKey = NormalizeName(name)
+    local history = GetActiveLootHistory()
+    rollType = rollType == "OS" and "OS" or "MS"
+    local typedHistory = type(history) == "table" and history[rollType] or nil
+    return playerKey and type(typedHistory) == "table" and tonumber(typedHistory[playerKey]) or 0
+end
+
+local function GetRollDisplayName(name, rollType)
+    local count = GetLootWinCount(name, rollType)
+    if count > 0 then
+        return tostring(name) .. " |cff73e68a+" .. tostring(count) .. "|r"
+    end
+    return tostring(name)
+end
+
+local function AdjustLootWinCount(name, rollType, delta, broadcast)
+    if not AscensionRaidRollsDB or AscensionRaidRollsDB.msosPlusOneEnabled ~= true then
+        return false
+    end
+
+    local playerKey = NormalizeName(name)
+    if not playerKey then
+        return false
+    end
+
+    rollType = rollType == "OS" and "OS" or "MS"
+    AscensionRaidRollsDB.lootHistory = AscensionRaidRollsDB.lootHistory or { MS = {}, OS = {} }
+    AscensionRaidRollsDB.lootHistory.MS = AscensionRaidRollsDB.lootHistory.MS or {}
+    AscensionRaidRollsDB.lootHistory.OS = AscensionRaidRollsDB.lootHistory.OS or {}
+    local typedHistory = AscensionRaidRollsDB.lootHistory[rollType]
+    local nextCount = math.max(0, (tonumber(typedHistory[playerKey]) or 0) + (tonumber(delta) or 0))
+    if nextCount > 0 then
+        typedHistory[playerKey] = nextCount
+    else
+        typedHistory[playerKey] = nil
+    end
+    if broadcast and BroadcastLootCount then
+        BroadcastLootCount(playerKey, rollType, nextCount)
+    end
+    return true
+end
+
+local function RecordLootWin(name, rollType)
+    if not AscensionRaidRollsDB or AscensionRaidRollsDB.msosPlusOneEnabled ~= true then
+        return false
+    end
+
+    local playerKey = NormalizeName(name)
+    if not playerKey or awardedPlayersForRoll[playerKey] then
+        return false
+    end
+    rollType = rollType == "OS" and "OS" or "MS"
+
+    local maximumWinners = math.max(1, tonumber(currentTopRolls) or 1)
+    if #currentRollAwardOrder >= maximumWinners then
+        local replacedAward = table.remove(currentRollAwardOrder)
+        if replacedAward then
+            awardedPlayersForRoll[replacedAward.playerKey] = nil
+            AdjustLootWinCount(replacedAward.playerKey, replacedAward.rollType, -1, true)
+        end
+    end
+
+    currentRollAwardOrder[#currentRollAwardOrder + 1] = { playerKey = playerKey, rollType = rollType }
+    awardedPlayersForRoll[playerKey] = true
+    AdjustLootWinCount(playerKey, rollType, 1, true)
+    return true
+end
+
+local function ClearLootHistory()
+    if IsInRaid() and (not CanControlRolls or not CanControlRolls()) then
+        Print("only the current Master Looter can clear the shared MS/OS+1 history.")
+        return false
+    end
+    AscensionRaidRollsDB.lootHistory = { MS = {}, OS = {} }
+    awardedPlayersForRoll = {}
+    currentRollAwardOrder = {}
+    if BroadcastLootHistory then
+        BroadcastLootHistory()
+    end
+    if UpdateUI then
+        UpdateUI()
+    end
+    Print("MS/OS+1 loot history cleared.")
+    return true
+end
+
+IsInRaid = function()
     return (GetNumRaidMembers and GetNumRaidMembers() or 0) > 0
+end
+
+-- Base64 and JSON codecs are loaded from Features/SoftRes/Codec.lua.
+
+function AscensionRaidRollsSoftRes.IsPriorityEnabled()
+    if ShouldUseSyncedLootHistory() then
+        return AscensionRaidRollsSoftRes.syncedPriorityEnabled == true
+    end
+    return AscensionRaidRollsDB and AscensionRaidRollsDB.reservePriorityEnabled == true
+end
+
+function AscensionRaidRollsSoftRes.GetData()
+    return AscensionRaidRollsDB and AscensionRaidRollsDB.reserveData or nil
+end
+
+function AscensionRaidRollsSoftRes.IsPlayerSoftReserved(name, itemID)
+    return AscensionRaidRollsSoftRes.GetPlayerReserveCount(name, itemID) > 0
+end
+
+function AscensionRaidRollsSoftRes.GetPlayerReserveCount(name, itemID)
+    if not AscensionRaidRollsSoftRes.IsPriorityEnabled() then
+        return 0
+    end
+    local playerKey = NormalizeName(name)
+    local itemKey = tostring(tonumber(itemID) or 0)
+    if not playerKey or itemKey == "0" then
+        return 0
+    end
+    if ShouldUseSyncedLootHistory() then
+        return math.max(0, math.floor(tonumber(AscensionRaidRollsSoftRes.syncedPlayers[playerKey]) or 0))
+    end
+    local data = AscensionRaidRollsSoftRes.GetData()
+    return data and data.byItem and data.byItem[itemKey] and math.max(0, math.floor(tonumber(data.byItem[itemKey][playerKey]) or 0)) or 0
+end
+
+function AscensionRaidRollsSoftRes.GetTooltipReservations(itemID)
+    if not AscensionRaidRollsSoftRes.IsPriorityEnabled() then
+        return nil
+    end
+
+    local itemKey = tostring(tonumber(itemID) or 0)
+    if itemKey == "0" then
+        return nil
+    end
+
+    local reservations
+    local roster
+    if ShouldUseSyncedLootHistory() then
+        if not currentItemID or tonumber(currentItemID) ~= tonumber(itemID) then
+            return nil
+        end
+        reservations = AscensionRaidRollsSoftRes.syncedPlayers
+    else
+        local data = AscensionRaidRollsSoftRes.GetData()
+        reservations = data and data.byItem and data.byItem[itemKey] or nil
+        roster = data and data.roster or nil
+    end
+    if type(reservations) ~= "table" then
+        return nil
+    end
+
+    local result = {}
+    local playerKey, count
+    for playerKey, count in pairs(reservations) do
+        count = math.max(0, math.floor(tonumber(count) or 0))
+        if count > 0 then
+            local rosterEntry = roster and roster[playerKey] or nil
+            local raidEntry = raidMembers and raidMembers[playerKey] or nil
+            result[#result + 1] = {
+                name = rosterEntry and rosterEntry.name or raidEntry and raidEntry.name or playerKey,
+                count = count,
+            }
+        end
+    end
+    table.sort(result, function(a, b)
+        return tostring(a.name):lower() < tostring(b.name):lower()
+    end)
+    return result
+end
+
+function AscensionRaidRollsSoftRes.GetCurrentHardReserve()
+    if not AscensionRaidRollsSoftRes.IsPriorityEnabled() then
+        return nil
+    end
+    if ShouldUseSyncedLootHistory() then
+        return AscensionRaidRollsSoftRes.syncedHardReserve and true or nil
+    end
+    local data = AscensionRaidRollsSoftRes.GetData()
+    return data and data.hardItems and data.hardItems[tostring(tonumber(currentItemID) or 0)] or nil
+end
+
+function AscensionRaidRollsSoftRes.SetImportStatus(message, isError)
+    if optionsFrame and optionsFrame.reserveStatus then
+        optionsFrame.reserveStatus:SetText(tostring(message or ""))
+        if isError then
+            optionsFrame.reserveStatus:SetTextColor(1.0, 0.35, 0.35)
+        else
+            optionsFrame.reserveStatus:SetTextColor(0.45, 0.95, 0.55)
+        end
+    end
+    if AscensionRaidRollsSoftRes.importFrame and AscensionRaidRollsSoftRes.importFrame.status then
+        AscensionRaidRollsSoftRes.importFrame.status:SetText(tostring(message or ""))
+        if isError then
+            AscensionRaidRollsSoftRes.importFrame.status:SetTextColor(1.0, 0.35, 0.35)
+        else
+            AscensionRaidRollsSoftRes.importFrame.status:SetTextColor(0.45, 0.95, 0.55)
+        end
+    end
+end
+
+function AscensionRaidRollsSoftRes.ImportExport(encoded)
+    if IsInRaid() and (not CanControlRolls or not CanControlRolls()) then
+        AscensionRaidRollsSoftRes.SetImportStatus("Only the Master Looter can import reserves in a raid.", true)
+        return false
+    end
+
+    local decoded, decodeError = AscensionRaidRollsSoftRes.DecodeBase64(encoded)
+    if not decoded then
+        AscensionRaidRollsSoftRes.SetImportStatus("Import failed: " .. tostring(decodeError), true)
+        return false
+    end
+    local root, jsonError = AscensionRaidRollsSoftRes.DecodeJSON(decoded)
+    if type(root) ~= "table" then
+        AscensionRaidRollsSoftRes.SetImportStatus("Import failed: " .. tostring(jsonError or "invalid JSON"), true)
+        return false
+    end
+    if type(root.softreserves) ~= "table" or type(root.hardreserves) ~= "table" then
+        AscensionRaidRollsSoftRes.SetImportStatus("Import failed: missing softreserves/hardreserves lists.", true)
+        return false
+    end
+
+    local reserveData = {
+        metadata = root.metadata or {},
+        roster = {},
+        byItem = {},
+        hardItems = {},
+    }
+    local playerCount = 0
+    local reserveCount = 0
+    local _, playerData
+    for _, playerData in ipairs(root.softreserves) do
+        if type(playerData) == "table" and type(playerData.name) == "string" then
+            local playerKey = NormalizeName(playerData.name)
+            if playerKey then
+                local rosterEntry = { name = playerData.name, itemCount = 0 }
+                reserveData.roster[playerKey] = rosterEntry
+                playerCount = playerCount + 1
+                if type(playerData.items) == "table" then
+                    local _, itemData
+                    for _, itemData in ipairs(playerData.items) do
+                        local itemID = type(itemData) == "table" and tonumber(itemData.id) or tonumber(itemData)
+                        if itemID then
+                            local itemKey = tostring(math.floor(itemID))
+                            reserveData.byItem[itemKey] = reserveData.byItem[itemKey] or {}
+                            reserveData.byItem[itemKey][playerKey] = (tonumber(reserveData.byItem[itemKey][playerKey]) or 0) + 1
+                            rosterEntry.itemCount = rosterEntry.itemCount + 1
+                            reserveCount = reserveCount + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local hardCount = 0
+    local function AddHardReserve(itemID, owner)
+        itemID = tonumber(itemID)
+        if itemID then
+            reserveData.hardItems[tostring(math.floor(itemID))] = owner or true
+            hardCount = hardCount + 1
+        end
+    end
+    local _, hardData
+    for _, hardData in pairs(root.hardreserves) do
+        if type(hardData) == "number" then
+            AddHardReserve(hardData)
+        elseif type(hardData) == "table" then
+            AddHardReserve(hardData.id or hardData.itemId, hardData.name or hardData.player)
+            if type(hardData.items) == "table" then
+                local _, itemData
+                for _, itemData in ipairs(hardData.items) do
+                    AddHardReserve(type(itemData) == "table" and (itemData.id or itemData.itemId) or itemData, hardData.name or hardData.player)
+                end
+            end
+        end
+    end
+
+    AscensionRaidRollsDB.reserveData = reserveData
+    AscensionRaidRollsDB.reserveImportText = Trim(encoded)
+    AscensionRaidRollsSoftRes.SetImportStatus(tostring(playerCount) .. " players, " .. tostring(reserveCount) .. " SR, " .. tostring(hardCount) .. " HR imported.", false)
+    Print("SoftRes import complete: " .. tostring(playerCount) .. " players, " .. tostring(reserveCount) .. " reservations, " .. tostring(hardCount) .. " hard reserves.")
+    if AscensionRaidRollsSoftRes.BroadcastCurrentState then
+        AscensionRaidRollsSoftRes.BroadcastCurrentState()
+    end
+    if UpdateUI then UpdateUI() end
+    return true
 end
 
 -- A remote synchronized session exists only while the player is actually in
@@ -135,6 +456,9 @@ local function SendSyncRaw(message, channel, target)
     end
 
     channel = channel or "RAID"
+    if channel == "RAID" and not IsInRaid() then
+        return false
+    end
     if channel == "WHISPER" then
         if not target or target == "" then
             return false
@@ -146,28 +470,72 @@ local function SendSyncRaw(message, channel, target)
     return true
 end
 
-local function ParseVersion(version)
-    if type(version) ~= "string" then
-        return 0, 0, 0
+BroadcastLootHistory = function(channel, target)
+    if not AscensionRaidRollsDB or not CanControlRolls or not CanControlRolls() then
+        return false
     end
-    local major, minor, patch = version:match("^(%d+)%.(%d+)%.(%d+)")
-    return tonumber(major) or 0, tonumber(minor) or 0, tonumber(patch) or 0
+
+    channel = channel or "RAID"
+    AscensionRaidRollsDB.lootHistoryRevision = (tonumber(AscensionRaidRollsDB.lootHistoryRevision) or 0) + 1
+    local revision = AscensionRaidRollsDB.lootHistoryRevision
+    local enabled = AscensionRaidRollsDB.msosPlusOneEnabled == true and "1" or "0"
+    SendSyncRaw("PLUSBEGIN\t" .. tostring(revision) .. "\t" .. enabled, channel, target)
+
+    local _, rollType
+    for _, rollType in ipairs({ "MS", "OS" }) do
+        local playerKey, count
+        for playerKey, count in pairs((AscensionRaidRollsDB.lootHistory and AscensionRaidRollsDB.lootHistory[rollType]) or {}) do
+            count = math.max(0, math.floor(tonumber(count) or 0))
+            if count > 0 then
+                SendSyncRaw("PLUSENTRY\t" .. tostring(revision) .. "\t" .. tostring(rollType) .. "\t" .. tostring(playerKey) .. "\t" .. tostring(count), channel, target)
+            end
+        end
+    end
+
+    SendSyncRaw("PLUSEND\t" .. tostring(revision), channel, target)
+    return true
 end
 
-local function IsVersionNewer(candidate, current)
-    local c1, c2, c3 = ParseVersion(candidate)
-    local a1, a2, a3 = ParseVersion(current)
-    if c1 ~= a1 then return c1 > a1 end
-    if c2 ~= a2 then return c2 > a2 end
-    return c3 > a3
+AscensionRaidRollsSoftRes.BroadcastCurrentState = function(channel, target)
+    if not AscensionRaidRollsDB or not CanControlRolls or not CanControlRolls() then
+        return false
+    end
+
+    channel = channel or "RAID"
+    local sessionID = tostring(syncSessionID or "0")
+    local enabled = AscensionRaidRollsDB.reservePriorityEnabled == true and "1" or "0"
+    local hardReserved = AscensionRaidRollsSoftRes.GetCurrentHardReserve() and "1" or "0"
+    SendSyncRaw("SRSTATE\t" .. sessionID .. "\t" .. enabled .. "\t" .. hardReserved, channel, target)
+
+    if enabled == "1" and currentItemID then
+        local data = AscensionRaidRollsSoftRes.GetData()
+        local reservations = data and data.byItem and data.byItem[tostring(tonumber(currentItemID) or 0)] or nil
+        local playerKey
+        local playerKey, reserveCount
+        for playerKey, reserveCount in pairs(reservations or {}) do
+            SendSyncRaw("SRPLAYER\t" .. sessionID .. "\t" .. tostring(playerKey) .. "\t" .. tostring(math.max(1, tonumber(reserveCount) or 1)), channel, target)
+        end
+    end
+    return true
+end
+
+BroadcastLootCount = function(playerKey, rollType, count)
+    if not IsInRaid() or not CanControlRolls or not CanControlRolls() then
+        return false
+    end
+
+    AscensionRaidRollsDB.lootHistoryRevision = (tonumber(AscensionRaidRollsDB.lootHistoryRevision) or 0) + 1
+    local revision = AscensionRaidRollsDB.lootHistoryRevision
+    rollType = rollType == "OS" and "OS" or "MS"
+    return SendSyncRaw("PLUSSET\t" .. tostring(revision) .. "\t" .. tostring(rollType) .. "\t" .. tostring(playerKey) .. "\t" .. tostring(math.max(0, tonumber(count) or 0)), "RAID")
 end
 
 local function NotifyNewerVersion(version, sender)
-    if not IsVersionNewer(version, ADDON_VERSION) then
+    if not AscensionRaidRolls.Version.IsNewer(version, ADDON_VERSION) then
         return
     end
 
-    if IsVersionNewer(version, latestSeenVersion) then
+    if AscensionRaidRolls.Version.IsNewer(version, latestSeenVersion) then
         latestSeenVersion = version
     end
 
@@ -456,6 +824,9 @@ end
 
 local function SortRolls(list)
     table.sort(list, function(a, b)
+        if a.isSoftReserved ~= b.isSoftReserved then
+            return a.isSoftReserved == true
+        end
         if a.roll ~= b.roll then
             return a.roll > b.roll
         end
@@ -497,7 +868,9 @@ local function RefreshDuplicateFlags()
 
     for i = 1, #all do
         local entry = all[i]
-        entry.isFirst = firstRollByPlayer[entry.playerKey] == entry.sequence
+        if entry.isFirst == nil then
+            entry.isFirst = firstRollByPlayer[entry.playerKey] == entry.sequence
+        end
         entry.isReroll = not entry.isFirst
         entry.hasDuplicate = (counts[entry.playerKey] or 0) > 1
         entry.isTied = false
@@ -522,7 +895,7 @@ local function FindValidEntry(playerKey, rollType)
     local i
     for i = 1, #list do
         local entry = list[i]
-        if entry.playerKey == playerKey and firstRollByPlayer[playerKey] == entry.sequence then
+        if entry.playerKey == playerKey and entry.isFirst then
             return entry
         end
     end
@@ -570,7 +943,9 @@ local function GetWinner()
     for i = 1, #rollsMS do
         local entry = rollsMS[i]
         if entry.isFirst then
-            if not bestMS or entry.roll > bestMS.roll or (entry.roll == bestMS.roll and entry.sequence < bestMS.sequence) then
+            if not bestMS
+                or (entry.isSoftReserved and not bestMS.isSoftReserved)
+                or (entry.isSoftReserved == bestMS.isSoftReserved and (entry.roll > bestMS.roll or (entry.roll == bestMS.roll and entry.sequence < bestMS.sequence))) then
                 bestMS = entry
             end
         end
@@ -649,16 +1024,43 @@ local function UpdatePanel(panel, list)
 
             row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
             row.name:SetPoint("LEFT", row.rank, "RIGHT", 5, 0)
-            row.name:SetWidth(80)
+            row.name:SetWidth(100)
             row.name:SetJustifyH("LEFT")
 
+            row.minusButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            row.minusButton:SetWidth(14)
+            row.minusButton:SetHeight(14)
+            row.minusButton:SetText("-")
+            row.minusButton:SetScript("OnClick", function(self)
+                local entry = self:GetParent().entry
+                if entry and CanControlRolls and CanControlRolls() then
+                    AdjustLootWinCount(entry.name, entry.type, -1, true)
+                    UpdateUI()
+                end
+            end)
+
+            row.plusButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            row.plusButton:SetWidth(14)
+            row.plusButton:SetHeight(14)
+            row.plusButton:SetPoint("RIGHT", row, "RIGHT", -3, 0)
+            row.plusButton:SetText("+")
+            row.plusButton:SetScript("OnClick", function(self)
+                local entry = self:GetParent().entry
+                if entry and CanControlRolls and CanControlRolls() then
+                    AdjustLootWinCount(entry.name, entry.type, 1, true)
+                    UpdateUI()
+                end
+            end)
+
+            row.minusButton:SetPoint("RIGHT", row.plusButton, "LEFT", -1, 0)
+
             row.status = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            row.status:SetPoint("LEFT", row.name, "RIGHT", 3, 0)
-            row.status:SetWidth(47)
+            row.status:SetPoint("LEFT", row.name, "RIGHT", 2, 0)
+            row.status:SetWidth(36)
             row.status:SetJustifyH("CENTER")
 
             row.value = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-            row.value:SetPoint("RIGHT", row, "RIGHT", -3, 0)
+            row.value:SetPoint("RIGHT", row.minusButton, "LEFT", -2, 0)
             row.value:SetWidth(34)
             row.value:SetJustifyH("RIGHT")
 
@@ -668,10 +1070,22 @@ local function UpdatePanel(panel, list)
         local entry = list[i]
         row.entry = entry
 
+        local showAdjustmentButtons = entry.isFirst and IsMSOSPlusOneEnabled()
+        if showAdjustmentButtons then
+            local canAdjust = CanControlRolls and CanControlRolls() or false
+            row.minusButton:Show()
+            row.plusButton:Show()
+            SetButtonEnabled(row.minusButton, canAdjust)
+            SetButtonEnabled(row.plusButton, canAdjust)
+        else
+            row.minusButton:Hide()
+            row.plusButton:Hide()
+        end
+
         if entry.isFirst then
             validRank = validRank + 1
             row.rank:SetText(validRank .. ".")
-            row.name:SetText(GetClassColorCode(entry.name) .. entry.name .. "|r")
+            row.name:SetText(GetClassColorCode(entry.name) .. GetRollDisplayName(entry.name, entry.type) .. "|r")
             row.value:SetText(entry.roll)
             row.rank:SetTextColor(1, 1, 1)
             row.value:SetTextColor(1, 0.82, 0.20)
@@ -695,6 +1109,10 @@ local function UpdatePanel(panel, list)
                 row.status:SetText("TB " .. tostring(latestTieRoll))
                 row.status:SetTextColor(0.45, 0.95, 0.55)
                 row.bg:SetTexture(0.08, 0.45, 0.18, 0.16)
+            elseif entry.isSoftReserved then
+                row.status:SetText(tostring(entry.softReserveIndex or 1) .. "xSR")
+                row.status:SetTextColor(0.75, 0.45, 1.0)
+                row.bg:SetTexture(0.38, 0.12, 0.60, 0.22)
             elseif entry.hasDuplicate then
                 row.status:SetText("FIRST")
                 row.status:SetTextColor(0.35, 1.0, 0.35)
@@ -710,7 +1128,7 @@ local function UpdatePanel(panel, list)
         else
             row.rank:SetText("x")
             row.rank:SetTextColor(1.0, 0.35, 0.35)
-            row.name:SetText("|cff888888" .. entry.name .. "|r")
+            row.name:SetText("|cff888888" .. GetRollDisplayName(entry.name, entry.type) .. "|r")
             row.status:SetText("REROLL")
             row.status:SetTextColor(1.0, 0.35, 0.35)
             row.value:SetText(entry.roll)
@@ -734,7 +1152,7 @@ local function UpdatePanel(panel, list)
     end
 end
 
-local function SetButtonEnabled(button, enabled)
+SetButtonEnabled = function(button, enabled)
     if not button then
         return
     end
@@ -852,7 +1270,7 @@ local function AddTieBreakRoll(name, roll, minimum, maximum, bypassRaidCheck)
     return true
 end
 
-local function AddRoll(name, roll, minimum, maximum, bypassRaidCheck)
+local function AddRoll(name, roll, minimum, maximum, bypassRaidCheck, validOverride, softReserveIndexOverride)
     if minimum ~= 1 then
         return false
     end
@@ -893,11 +1311,36 @@ local function AddRoll(name, roll, minimum, maximum, bypassRaidCheck)
         return false
     end
 
+    local allRolls = GetAllRolls()
+    local hasValidRoll = false
+    local validMSRolls = 0
+    local i
+    for i = 1, #allRolls do
+        local previous = allRolls[i]
+        if previous.playerKey == playerKey and previous.isFirst then
+            hasValidRoll = true
+            if previous.type == "MS" then validMSRolls = validMSRolls + 1 end
+        end
+    end
+
+    local reserveCount = rollType == "MS" and AscensionRaidRollsSoftRes.GetPlayerReserveCount(name, currentItemID) or 0
+    local isValid
+    if rollType == "MS" and reserveCount > 0 then
+        isValid = validMSRolls < reserveCount
+    else
+        isValid = not hasValidRoll
+    end
+    local softReserveIndex = isValid and reserveCount > 0 and (validMSRolls + 1) or nil
+    if validOverride ~= nil then isValid = validOverride == true end
+    if tonumber(softReserveIndexOverride) and tonumber(softReserveIndexOverride) > 0 then
+        softReserveIndex = math.floor(tonumber(softReserveIndexOverride))
+    elseif validOverride == false then
+        softReserveIndex = nil
+    end
+
     sequence = sequence + 1
 
-    if not firstRollByPlayer[playerKey] then
-        firstRollByPlayer[playerKey] = sequence
-    end
+    if isValid and not firstRollByPlayer[playerKey] then firstRollByPlayer[playerKey] = sequence end
 
     local entry = {
         name = name,
@@ -907,6 +1350,9 @@ local function AddRoll(name, roll, minimum, maximum, bypassRaidCheck)
         maximum = maximum,
         type = rollType,
         sequence = sequence,
+        isFirst = isValid,
+        isSoftReserved = softReserveIndex ~= nil,
+        softReserveIndex = softReserveIndex,
     }
     targetList[#targetList + 1] = entry
 
@@ -952,6 +1398,8 @@ BroadcastRollSync = function(entry, channel, target)
         tostring(entry.roll or 0),
         tostring(entry.minimum or 1),
         tostring(entry.maximum or 0),
+        entry.isFirst and "1" or "0",
+        tostring(entry.softReserveIndex or 0),
     }, "\t")
 
     return SendSyncRaw(message, channel or "RAID", target)
@@ -964,6 +1412,7 @@ SendFullSyncState = function(target)
 
     if not rollSessionStarted or not syncSessionID then
         SendSyncRaw("IDLE\t" .. tostring(SYNC_PROTOCOL), "WHISPER", target)
+        BroadcastLootHistory("WHISPER", target)
         return true
     end
 
@@ -985,6 +1434,8 @@ SendFullSyncState = function(target)
 
     SendSyncRaw(stateMessage, "WHISPER", target)
     SendSyncRaw("TOP\t" .. tostring(syncSessionID) .. "\t" .. tostring(currentTopRolls or 1), "WHISPER", target)
+    AscensionRaidRollsSoftRes.BroadcastCurrentState("WHISPER", target)
+    BroadcastLootHistory("WHISPER", target)
 
     local all = GetAllRolls()
     table.sort(all, function(a, b)
@@ -1002,7 +1453,7 @@ SendFullSyncState = function(target)
     -- that player has already used their one allowed reroll for this round.
     for i = 1, #all do
         local entry = all[i]
-        if firstRollByPlayer[entry.playerKey] == entry.sequence and entry.tiePath and #entry.tiePath > 0 then
+        if entry.isFirst and entry.tiePath and #entry.tiePath > 0 then
             local pathParts = {}
             local pathLimit = #entry.tiePath
             if tieBreakActive and tieBreakPlayers[entry.playerKey] and tieBreakRoundRolls[entry.playerKey] ~= nil then
@@ -1111,6 +1562,82 @@ local function SendRaidAnnouncement(message, allowRaidFallback)
 
     Print("you must be raid leader or assistant to send this message in /rw.")
     return false
+end
+
+local function CheckMissingReservations()
+    if not IsInRaid() then
+        Print("join a raid before checking the SoftRes roster.")
+        return false
+    end
+    if not CanControlRolls or not CanControlRolls() then
+        Print("only the Master Looter can check missing reservations in a raid.")
+        return false
+    end
+    local data = AscensionRaidRollsSoftRes.GetData()
+    if not data or type(data.roster) ~= "table" then
+        Print("import a SoftRes list first.")
+        return false
+    end
+
+    local limit = math.max(1, math.floor(tonumber(AscensionRaidRollsDB.softResLimit) or 2))
+    local missing = {}
+    local incomplete = {}
+    local raidCount = GetNumRaidMembers and GetNumRaidMembers() or 0
+    local i
+    for i = 1, raidCount do
+        local raidName = GetRaidRosterInfo(i)
+        local playerKey = NormalizeName(raidName)
+        if playerKey then
+            local entry = data.roster[playerKey]
+            if not entry then
+                missing[#missing + 1] = tostring(raidName)
+            else
+                local count = math.max(0, math.floor(tonumber(entry.itemCount) or 0))
+                if count < limit then
+                    incomplete[#incomplete + 1] = tostring(raidName) .. " (" .. tostring(count) .. "/" .. tostring(limit) .. ")"
+                end
+            end
+        end
+    end
+    table.sort(missing)
+    table.sort(incomplete)
+
+    local function AnnounceList(prefix, list)
+        local line = prefix
+        local index
+        for index = 1, #list do
+            local addition = (line == prefix and "" or ", ") .. list[index]
+            if #line + #addition > 220 then
+                SendRaidAnnouncement(line, true)
+                line = prefix .. list[index]
+            else
+                line = line .. addition
+            end
+        end
+        if line ~= prefix then SendRaidAnnouncement(line, true) end
+    end
+
+    if #missing > 0 then
+        AnnounceList("Missing from SoftRes export: ", missing)
+    end
+    if #incomplete > 0 then
+        AnnounceList("Incomplete SoftRes (max " .. tostring(limit) .. "): ", incomplete)
+    end
+    if #missing > 0 or #incomplete > 0 then
+        local reservationURL = Trim(AscensionRaidRollsDB.softResURL or "") or ""
+        local invitation = "Please complete your SoftRes reservations"
+        if reservationURL ~= "" then
+            invitation = invitation .. ": " .. reservationURL
+        else
+            invitation = invitation .. " on the BisBeard reservation page."
+        end
+        SendRaidAnnouncement(invitation, false)
+    end
+    if #missing == 0 and #incomplete == 0 then
+        SendRaidAnnouncement("SoftRes check: every raid member is in the export and has used " .. tostring(limit) .. "/" .. tostring(limit) .. " reservations.", true)
+    end
+    Print("SoftRes roster check: " .. tostring(#missing) .. " missing from export, " .. tostring(#incomplete) .. " below the " .. tostring(limit) .. " SR limit.")
+    return true
 end
 
 local function ShowLocalTimerAlert(text)
@@ -1423,6 +1950,19 @@ local function SetCurrentItem(itemLink, itemID)
     end
     UpdateItemDisplay()
     return true
+end
+
+AscensionRaidRolls.SetRollItem = function(itemLink, itemID)
+    if CanControlRolls and not CanControlRolls() then
+        Print("only the current Master Looter can choose the roll item.")
+        return false
+    end
+    if SetCurrentItem(itemLink, itemID) then
+        if mainFrame then mainFrame:Show() end
+        Print("selected " .. tostring(itemLink or itemID) .. " for the next roll.")
+        return true
+    end
+    return false
 end
 
 local function ClearCurrentItem()
@@ -1910,6 +2450,16 @@ local function StartTimedRoll()
         return
     end
 
+    local hardReserve = AscensionRaidRollsSoftRes.GetCurrentHardReserve()
+    if hardReserve then
+        local ownerText = type(hardReserve) == "string" and hardReserve ~= "" and (" for " .. hardReserve) or ""
+        Print("this item is Hard Reserved" .. ownerText .. "; no roll was started.")
+        if UIErrorsFrame and UIErrorsFrame.AddMessage then
+            UIErrorsFrame:AddMessage("HARD RESERVED" .. ownerText, 1.0, 0.25, 0.25, 1.0)
+        end
+        return
+    end
+
     local raidCount = GetNumRaidMembers and GetNumRaidMembers() or 0
     local inRaid = raidCount > 0
 
@@ -1918,16 +2468,19 @@ local function StartTimedRoll()
     UpdateItemDisplay()
 
     local startMessage
+    local priorityLabel = AscensionRaidRollsSoftRes.IsPriorityEnabled() and "SR > MS > OS - " or ""
     if (tonumber(currentTopRolls) or 1) > 1 then
-        startMessage = "Top " .. tostring(currentTopRolls) .. " Rolls " .. currentItemLink .. " - MS: /roll 100 - OS: /roll 99 - " .. activeDuration .. " sec"
+        startMessage = "Top " .. tostring(currentTopRolls) .. " Rolls " .. currentItemLink .. " - " .. priorityLabel .. "MS: /roll 100 - OS: /roll 99 - " .. activeDuration .. " sec"
     else
-        startMessage = "Roll " .. currentItemLink .. " - MS: /roll 100 - OS: /roll 99 - " .. activeDuration .. " sec"
+        startMessage = "Roll " .. currentItemLink .. " - " .. priorityLabel .. "MS: /roll 100 - OS: /roll 99 - " .. activeDuration .. " sec"
     end
     if not SendRaidAnnouncement(startMessage, true) then
         return
     end
 
     ClearRolls()
+    awardedPlayersForRoll = {}
+    currentRollAwardOrder = {}
     rollSessionStarted = true
     rollSessionOpen = true
     rollTimerActive = true
@@ -1963,6 +2516,8 @@ local function StartTimedRoll()
             Print("raid synchronization is unavailable on this client; other addon users will not receive the shared timer.")
         else
             SendSyncRaw("TOP\t" .. tostring(syncSessionID) .. "\t" .. tostring(currentTopRolls or 1), "RAID")
+            AscensionRaidRollsSoftRes.BroadcastCurrentState("RAID")
+            BroadcastLootHistory("RAID")
         end
     end
 
@@ -2155,10 +2710,16 @@ local function TradeWinner()
         return
     end
 
-    -- Trade now also announces the manually selected winner. This happens
-    -- before the actual trade so selecting yourself still produces the winner
-    -- announcement even though WoW cannot open a trade with yourself.
-    SendRaidAnnouncement(selectedRoll.name .. " has won " .. currentItemLink, true)
+    -- The winner announcement is optional. Muting it never changes winner
+    -- tracking or the trade flow; it only suppresses the chat/RW message.
+    if not AscensionRaidRollsDB.muteWinnerAnnouncement then
+        SendRaidAnnouncement(selectedRoll.name .. " has won " .. currentItemLink, true)
+    end
+
+    if RecordLootWin(selectedRoll.name, selectedRoll.type) then
+        Print(selectedRoll.name .. " is now " .. tostring(selectedRoll.type) .. " +" .. tostring(GetLootWinCount(selectedRoll.name, selectedRoll.type)) .. " for this loot history.")
+        UpdateUI()
+    end
 
     if unit == "player" then
         Print("winner announced. The selected player is you, so no trade was opened.")
@@ -2376,6 +2937,9 @@ UpdateControlState = function()
     if mainFrame.masterLooterLabel then
         mainFrame.masterLooterLabel:SetAlpha(canControl and 1.0 or 0.55)
     end
+    if UpdateOptionsControlState then
+        UpdateOptionsControlState()
+    end
 end
 
 local function ApplySyncedSession(sender, sessionID, isOpen, remaining, duration, itemID, itemLink, fromSnapshot)
@@ -2501,12 +3065,21 @@ local function ClearRemoteRaidStateOutsideRaid()
 
     if syncOwner and not IsSamePlayerName(syncOwner, UnitName("player")) then
         ClearRolls()
+        awardedPlayersForRoll = {}
+        currentRollAwardOrder = {}
         CancelRollSession()
         syncSessionID = nil
         syncOwner = nil
         syncStateRequested = false
         syncReceivingState = false
         selectedRoll = nil
+        syncedLootHistory = { MS = {}, OS = {} }
+        syncedPlusOneEnabled = false
+        AscensionRaidRollsSoftRes.syncedPriorityEnabled = false
+        AscensionRaidRollsSoftRes.syncedPlayers = {}
+        AscensionRaidRollsSoftRes.syncedHardReserve = false
+        syncedLootHistoryRevision = 0
+        pendingSyncedLootHistory = nil
         currentItemLink = nil
         currentItemID = nil
         currentTopRolls = 1
@@ -2538,7 +3111,7 @@ local function HandleAddonSync(prefix, message, channel, sender)
         local protocol, version = message:match("^VER\t([^\t]+)\t([^\t]+)$")
         if version then
             NotifyNewerVersion(version, sender)
-            if IsVersionNewer(ADDON_VERSION, version) then
+            if AscensionRaidRolls.Version.IsNewer(ADDON_VERSION, version) then
                 SendSyncRaw("VER\t" .. tostring(SYNC_PROTOCOL) .. "\t" .. tostring(ADDON_VERSION), "WHISPER", sender)
             end
         end
@@ -2556,6 +3129,96 @@ local function HandleAddonSync(prefix, message, channel, sender)
     -- Master Looter. This prevents assistants or ordinary raid members from
     -- creating fake roll sessions for other addon users.
     if not IsSenderCurrentMasterLooter(sender) then
+        return
+    end
+
+    if command == "SRSTATE" then
+        local sessionID, enabled, hardReserved = message:match("^SRSTATE\t([^\t]+)\t([01])\t([01])$")
+        if sessionID and (sessionID == "0" or not syncSessionID or tostring(sessionID) == tostring(syncSessionID)) then
+            AscensionRaidRollsSoftRes.syncedPriorityEnabled = enabled == "1"
+            AscensionRaidRollsSoftRes.syncedHardReserve = hardReserved == "1"
+            AscensionRaidRollsSoftRes.syncedPlayers = {}
+            UpdateItemDisplay()
+            UpdateUI()
+        end
+        return
+    end
+
+    if command == "SRPLAYER" then
+        local sessionID, playerKey, reserveCount = message:match("^SRPLAYER\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
+        if not sessionID then
+            sessionID, playerKey = message:match("^SRPLAYER\t([^\t]+)\t([^\t]+)$")
+            reserveCount = 1
+        end
+        if sessionID and playerKey and (sessionID == "0" or not syncSessionID or tostring(sessionID) == tostring(syncSessionID)) then
+            playerKey = NormalizeName(playerKey)
+            if playerKey then AscensionRaidRollsSoftRes.syncedPlayers[playerKey] = math.max(1, math.floor(tonumber(reserveCount) or 1)) end
+            UpdateUI()
+        end
+        return
+    end
+
+    if command == "PLUSBEGIN" then
+        local revision, enabled = message:match("^PLUSBEGIN\t([^\t]+)\t([01])$")
+        revision = tonumber(revision)
+        if revision and revision >= syncedLootHistoryRevision then
+            pendingSyncedLootHistory = {
+                revision = revision,
+                enabled = enabled == "1",
+                history = { MS = {}, OS = {} },
+            }
+        end
+        return
+    end
+
+    if command == "PLUSENTRY" then
+        local revision, rollType, playerKey, count = message:match("^PLUSENTRY\t([^\t]+)\t([A-Z]+)\t([^\t]+)\t([^\t]+)$")
+        if rollType ~= "MS" and rollType ~= "OS" then revision = nil end
+        if not revision then
+            revision, playerKey, count = message:match("^PLUSENTRY\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
+            rollType = "MS"
+        end
+        revision = tonumber(revision)
+        count = math.max(0, math.floor(tonumber(count) or 0))
+        if pendingSyncedLootHistory and revision == pendingSyncedLootHistory.revision and count > 0 then
+            pendingSyncedLootHistory.history[rollType][NormalizeName(playerKey) or playerKey] = count
+        end
+        return
+    end
+
+    if command == "PLUSEND" then
+        local revision = tonumber(message:match("^PLUSEND\t([^\t]+)$"))
+        if pendingSyncedLootHistory and revision == pendingSyncedLootHistory.revision then
+            syncedLootHistoryRevision = revision
+            syncedPlusOneEnabled = pendingSyncedLootHistory.enabled
+            syncedLootHistory = pendingSyncedLootHistory.history
+            pendingSyncedLootHistory = nil
+            UpdateUI()
+        end
+        return
+    end
+
+    if command == "PLUSSET" then
+        local revision, rollType, playerKey, count = message:match("^PLUSSET\t([^\t]+)\t([A-Z]+)\t([^\t]+)\t([^\t]+)$")
+        if rollType ~= "MS" and rollType ~= "OS" then revision = nil end
+        if not revision then
+            revision, playerKey, count = message:match("^PLUSSET\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
+            rollType = "MS"
+        end
+        revision = tonumber(revision)
+        count = math.max(0, math.floor(tonumber(count) or 0))
+        playerKey = NormalizeName(playerKey)
+        if revision and playerKey and revision >= syncedLootHistoryRevision then
+            syncedLootHistoryRevision = revision
+            if count > 0 then
+                syncedLootHistory[rollType] = syncedLootHistory[rollType] or {}
+                syncedLootHistory[rollType][playerKey] = count
+            else
+                syncedLootHistory[rollType] = syncedLootHistory[rollType] or {}
+                syncedLootHistory[rollType][playerKey] = nil
+            end
+            UpdateUI()
+        end
         return
     end
 
@@ -2586,10 +3249,25 @@ local function HandleAddonSync(prefix, message, channel, sender)
     end
 
     if command == "ROLL" then
-        local sessionID, playerName, roll, minimum, maximum = message:match("^ROLL\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
+        local sessionID, playerName, roll, minimum, maximum, validFlag, softReserveIndex = message:match("^ROLL\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([01])\t([^\t]+)$")
+        if not sessionID then
+            local reserved
+            sessionID, playerName, roll, minimum, maximum, reserved = message:match("^ROLL\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([01])$")
+            if sessionID then
+                softReserveIndex = reserved == "1" and "1" or "0"
+            else
+                sessionID, playerName, roll, minimum, maximum = message:match("^ROLL\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
+            end
+        end
         if sessionID and syncSessionID and tostring(sessionID) == tostring(syncSessionID) then
             if rollSessionOpen or syncReceivingState then
-                AddRoll(playerName, tonumber(roll), tonumber(minimum), tonumber(maximum), true)
+                local validOverride
+                if validFlag == "1" then
+                    validOverride = true
+                elseif validFlag == "0" then
+                    validOverride = false
+                end
+                AddRoll(playerName, tonumber(roll), tonumber(minimum), tonumber(maximum), true, validOverride, tonumber(softReserveIndex))
             end
         end
         return
@@ -2713,6 +3391,8 @@ local function ResetRollSessionByController()
         end
 
         ClearRolls()
+        awardedPlayersForRoll = {}
+        currentRollAwardOrder = {}
         CancelRollSession()
         syncSessionID = nil
         syncOwner = UnitName("player")
@@ -2730,6 +3410,8 @@ local function ResetRollSessionByController()
     end
 
     ClearRolls()
+    awardedPlayersForRoll = {}
+    currentRollAwardOrder = {}
     selectedRoll = nil
     UpdateUI()
     return true, "local"
@@ -3269,7 +3951,7 @@ end
 local function CreateRollPanel(parent, anchorPoint, xOffset)
     local panel = CreateFrame("Frame", nil, parent)
     panel:SetPoint(anchorPoint, parent, anchorPoint, xOffset, -181)
-    panel:SetWidth(235)
+    panel:SetWidth(275)
     panel:SetHeight(304)
 
     panel.bg = panel:CreateTexture(nil, "BACKGROUND")
@@ -3293,7 +3975,7 @@ local function CreateRollPanel(parent, anchorPoint, xOffset)
     end)
 
     panel.content = CreateFrame("Frame", nil, panel.scroll)
-    panel.content:SetWidth(196)
+    panel.content:SetWidth(236)
     panel.content:SetHeight(1)
     panel.scroll:SetScrollChild(panel.content)
     panel.rows = {}
@@ -3301,9 +3983,460 @@ local function CreateRollPanel(parent, anchorPoint, xOffset)
     return panel
 end
 
+UpdateOptionsControlState = function()
+    if not optionsFrame then
+        return
+    end
+
+    local canManageHistory = not IsInRaid() or (CanControlRolls and CanControlRolls())
+    optionsFrame.plusOneCheck:SetChecked(IsMSOSPlusOneEnabled())
+    SetButtonEnabled(optionsFrame.plusOneCheck, canManageHistory)
+    SetButtonEnabled(optionsFrame.clearHistoryButton, canManageHistory)
+    if optionsFrame.muteWinnerCheck then
+        SetButtonEnabled(optionsFrame.muteWinnerCheck, canManageHistory)
+    end
+    if optionsFrame.reserveModeCheck then
+        optionsFrame.reserveModeCheck:SetChecked(AscensionRaidRollsSoftRes.IsPriorityEnabled())
+        SetButtonEnabled(optionsFrame.reserveModeCheck, canManageHistory)
+        SetButtonEnabled(optionsFrame.reserveImportButton, canManageHistory)
+        SetButtonEnabled(optionsFrame.reserveCheckButton, canManageHistory)
+        if optionsFrame.reserveLimitEdit then
+            optionsFrame.reserveLimitEdit:EnableMouse(canManageHistory)
+            optionsFrame.reserveLimitEdit:SetTextColor(canManageHistory and 1 or 0.5, canManageHistory and 1 or 0.5, canManageHistory and 1 or 0.5)
+        end
+        if optionsFrame.reserveURLEdit then
+            optionsFrame.reserveURLEdit:EnableMouse(canManageHistory)
+            optionsFrame.reserveURLEdit:SetTextColor(canManageHistory and 1 or 0.5, canManageHistory and 1 or 0.5, canManageHistory and 1 or 0.5)
+        end
+    end
+
+    if optionsFrame.historyText then
+        local players = 0
+        local items = 0
+        local seenPlayers = {}
+        local history = GetActiveLootHistory() or {}
+        local _, rollType
+        for _, rollType in ipairs({ "MS", "OS" }) do
+            local playerKey, count
+            for playerKey, count in pairs(history[rollType] or {}) do
+                if not seenPlayers[playerKey] then
+                    seenPlayers[playerKey] = true
+                    players = players + 1
+                end
+                items = items + (tonumber(count) or 0)
+            end
+        end
+        optionsFrame.historyText:SetText("History: " .. tostring(items) .. " MS+OS items / " .. tostring(players) .. " players")
+    end
+    if optionsFrame.reserveStatus and not ShouldUseSyncedLootHistory() then
+        local data = AscensionRaidRollsSoftRes.GetData()
+        if data and type(data.roster) == "table" then
+            local players, reserves, hard = 0, 0, 0
+            local _, entry
+            for _, entry in pairs(data.roster) do players = players + 1; reserves = reserves + (tonumber(entry.itemCount) or 0) end
+            for _ in pairs(data.hardItems or {}) do hard = hard + 1 end
+            optionsFrame.reserveStatus:SetText(tostring(players) .. " players, " .. tostring(reserves) .. " SR, " .. tostring(hard) .. " HR imported.")
+        end
+    end
+end
+
+function AscensionRaidRollsSoftRes.CreateImportFrame()
+    if AscensionRaidRollsSoftRes.importFrame then
+        return AscensionRaidRollsSoftRes.importFrame
+    end
+
+    local frame = CreateFrame("Frame", "AscensionRaidRollsReserveImportFrame", UIParent)
+    frame:SetWidth(800)
+    frame:SetHeight(560)
+    frame:SetFrameStrata("FULLSCREEN_DIALOG")
+    frame:SetClampedToScreen(true)
+    frame:EnableMouse(true)
+    frame:SetMovable(true)
+    frame:RegisterForDrag("LeftButton")
+    frame:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    frame:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    frame:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true,
+        tileSize = 32,
+        edgeSize = 32,
+        insets = { left = 11, right = 12, top = 12, bottom = 11 },
+    })
+    frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+
+    frame.title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    frame.title:SetPoint("TOP", frame, "TOP", 0, -19)
+    frame.title:SetText("Import SoftRes / HardRes")
+
+    frame.help = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.help:SetPoint("TOPLEFT", frame, "TOPLEFT", 38, -60)
+    frame.help:SetWidth(720)
+    frame.help:SetJustifyH("LEFT")
+    frame.help:SetText("Paste the complete BisBeard Base64 export below.")
+    frame.help:SetTextColor(0.75, 0.75, 0.75)
+
+    frame.editBackground = CreateFrame("Frame", nil, frame)
+    frame.editBackground:SetPoint("TOPLEFT", frame, "TOPLEFT", 38, -85)
+    frame.editBackground:SetWidth(724)
+    frame.editBackground:SetHeight(370)
+    frame.editBackground:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true,
+        tileSize = 16,
+        edgeSize = 8,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+    frame.editBackground:SetBackdropColor(0.01, 0.01, 0.01, 0.98)
+    frame.editBackground:SetBackdropBorderColor(0.55, 0.55, 0.55, 1.0)
+
+    frame.scroll = CreateFrame("ScrollFrame", nil, frame.editBackground, "UIPanelScrollFrameTemplate")
+    frame.scroll:SetPoint("TOPLEFT", frame.editBackground, "TOPLEFT", 8, -8)
+    frame.scroll:SetPoint("BOTTOMRIGHT", frame.editBackground, "BOTTOMRIGHT", -28, 8)
+    frame.scroll:EnableMouseWheel(true)
+    frame.scroll:SetScript("OnMouseWheel", function(self, delta)
+        local current = self:GetVerticalScroll()
+        local range = self:GetVerticalScrollRange()
+        local nextScroll = current - (delta * 45)
+        if nextScroll < 0 then nextScroll = 0 end
+        if nextScroll > range then nextScroll = range end
+        self:SetVerticalScroll(nextScroll)
+    end)
+
+    frame.edit = CreateFrame("EditBox", nil, frame.scroll)
+    frame.edit:SetWidth(675)
+    frame.edit:SetHeight(350)
+    frame.edit:SetMultiLine(true)
+    frame.edit:SetAutoFocus(false)
+    frame.edit:SetMaxLetters(100000)
+    frame.edit:SetFontObject(GameFontHighlightSmall)
+    frame.edit:SetTextColor(1.0, 1.0, 1.0)
+    frame.edit:SetTextInsets(4, 4, 4, 4)
+    frame.edit:SetScript("OnEscapePressed", function(self) self:ClearFocus(); frame:Hide() end)
+    frame.scroll:SetScrollChild(frame.edit)
+
+    frame.status = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.status:SetPoint("TOPLEFT", frame, "TOPLEFT", 40, -468)
+    frame.status:SetWidth(720)
+    frame.status:SetJustifyH("LEFT")
+    frame.status:SetText("")
+
+    frame.importButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    frame.importButton:SetWidth(210)
+    frame.importButton:SetHeight(26)
+    frame.importButton:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 140, 28)
+    frame.importButton:SetText("Import")
+    frame.importButton:SetScript("OnClick", function()
+        if AscensionRaidRollsSoftRes.ImportExport(frame.edit:GetText()) then
+            frame.edit:ClearFocus()
+            frame:Hide()
+            UpdateOptionsControlState()
+        end
+    end)
+
+    frame.cancelButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    frame.cancelButton:SetWidth(210)
+    frame.cancelButton:SetHeight(26)
+    frame.cancelButton:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -140, 28)
+    frame.cancelButton:SetText("Cancel")
+    frame.cancelButton:SetScript("OnClick", function() frame.edit:ClearFocus(); frame:Hide() end)
+
+    frame.closeButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
+    frame.closeButton:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -4, -4)
+
+    frame:SetScript("OnShow", function()
+        frame.edit:SetText(AscensionRaidRollsDB.reserveImportText or "")
+        frame.status:SetText("")
+        frame.edit:SetFocus()
+        frame.edit:SetCursorPosition(0)
+        frame.scroll:SetVerticalScroll(0)
+    end)
+    frame:Hide()
+    AscensionRaidRollsSoftRes.importFrame = frame
+    return frame
+end
+
+local function CreateOptionsFrame()
+    if optionsFrame then
+        return
+    end
+
+    optionsFrame = CreateFrame("Frame", "AscensionRaidRollsOptionsFrame", UIParent)
+    optionsFrame:SetWidth(390)
+    optionsFrame:SetHeight(525)
+    optionsFrame:SetFrameStrata("DIALOG")
+    optionsFrame:SetClampedToScreen(true)
+    optionsFrame:EnableMouse(true)
+    optionsFrame:SetMovable(true)
+    optionsFrame:RegisterForDrag("LeftButton")
+    optionsFrame:SetScript("OnDragStart", function(self)
+        self:StartMoving()
+    end)
+    optionsFrame:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+    end)
+    optionsFrame:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true,
+        tileSize = 32,
+        edgeSize = 32,
+        insets = { left = 11, right = 12, top = 12, bottom = 11 },
+    })
+    optionsFrame:SetPoint("CENTER", UIParent, "CENTER", 300, 0)
+
+    optionsFrame.title = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    optionsFrame.title:SetPoint("TOP", optionsFrame, "TOP", 0, -18)
+    optionsFrame.title:SetText("AscensionRaidRolls Options")
+
+    optionsFrame.closeButton = CreateFrame("Button", nil, optionsFrame, "UIPanelCloseButton")
+    optionsFrame.closeButton:SetPoint("TOPRIGHT", optionsFrame, "TOPRIGHT", -4, -4)
+
+    optionsFrame.plusOneCheck = CreateFrame("CheckButton", nil, optionsFrame, "UICheckButtonTemplate")
+    optionsFrame.plusOneCheck:SetWidth(24)
+    optionsFrame.plusOneCheck:SetHeight(24)
+    optionsFrame.plusOneCheck:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 24, -55)
+    optionsFrame.plusOneCheck:SetScript("OnClick", function(self)
+        if IsInRaid() and (not CanControlRolls or not CanControlRolls()) then
+            self:SetChecked(IsMSOSPlusOneEnabled())
+            return
+        end
+        AscensionRaidRollsDB.msosPlusOneEnabled = self:GetChecked() and true or false
+        BroadcastLootHistory()
+        UpdateUI()
+        Print("MS/OS+1 " .. (AscensionRaidRollsDB.msosPlusOneEnabled and "enabled." or "disabled."))
+    end)
+
+    optionsFrame.plusOneLabel = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    optionsFrame.plusOneLabel:SetPoint("LEFT", optionsFrame.plusOneCheck, "RIGHT", 3, 0)
+    optionsFrame.plusOneLabel:SetText("Enable MS/OS+1 loot history")
+
+    optionsFrame.plusOneHelp = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.plusOneHelp:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 30, -82)
+    optionsFrame.plusOneHelp:SetWidth(330)
+    optionsFrame.plusOneHelp:SetJustifyH("LEFT")
+    optionsFrame.plusOneHelp:SetText("Shows separate +X counters in MS and OS. Trade credits the selected roll type; both histories persist until cleared.")
+    optionsFrame.plusOneHelp:SetTextColor(0.70, 0.70, 0.70)
+
+    optionsFrame.historyText = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.historyText:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 30, -121)
+    optionsFrame.historyText:SetTextColor(0.85, 0.85, 0.85)
+
+    optionsFrame.clearHistoryButton = CreateFrame("Button", nil, optionsFrame, "UIPanelButtonTemplate")
+    optionsFrame.clearHistoryButton:SetWidth(145)
+    optionsFrame.clearHistoryButton:SetHeight(22)
+    optionsFrame.clearHistoryButton:SetPoint("TOPRIGHT", optionsFrame, "TOPRIGHT", -25, -113)
+    optionsFrame.clearHistoryButton:SetText("Clear Loot History")
+    optionsFrame.clearHistoryButton:SetScript("OnClick", function()
+        ClearLootHistory()
+        if optionsFrame and optionsFrame.historyText then
+            optionsFrame.historyText:SetText("History: 0 items / 0 players")
+        end
+    end)
+
+    optionsFrame.separator = optionsFrame:CreateTexture(nil, "ARTWORK")
+    optionsFrame.separator:SetTexture(1, 1, 1, 0.12)
+    optionsFrame.separator:SetHeight(1)
+    optionsFrame.separator:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 24, -153)
+    optionsFrame.separator:SetPoint("TOPRIGHT", optionsFrame, "TOPRIGHT", -24, -153)
+
+    optionsFrame.reserveTitle = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    optionsFrame.reserveTitle:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 25, -169)
+    optionsFrame.reserveTitle:SetText("SoftRes / HardRes")
+
+    optionsFrame.reserveModeCheck = CreateFrame("CheckButton", nil, optionsFrame, "UICheckButtonTemplate")
+    optionsFrame.reserveModeCheck:SetWidth(24)
+    optionsFrame.reserveModeCheck:SetHeight(24)
+    optionsFrame.reserveModeCheck:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 24, -190)
+    optionsFrame.reserveModeCheck:SetScript("OnClick", function(self)
+        if IsInRaid() and (not CanControlRolls or not CanControlRolls()) then
+            self:SetChecked(AscensionRaidRollsSoftRes.IsPriorityEnabled())
+            return
+        end
+        AscensionRaidRollsDB.reservePriorityEnabled = self:GetChecked() and true or false
+        AscensionRaidRollsSoftRes.BroadcastCurrentState()
+        UpdateItemDisplay()
+        UpdateUI()
+        Print("SR > MS > OS priority " .. (AscensionRaidRollsDB.reservePriorityEnabled and "enabled." or "disabled."))
+    end)
+
+    optionsFrame.reserveModeLabel = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.reserveModeLabel:SetPoint("LEFT", optionsFrame.reserveModeCheck, "RIGHT", 3, 0)
+    optionsFrame.reserveModeLabel:SetText("Use SR > MS > OS priority")
+
+    optionsFrame.reserveLimitLabel = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.reserveLimitLabel:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 245, -196)
+    optionsFrame.reserveLimitLabel:SetText("SR allowed")
+
+    optionsFrame.reserveLimitEdit = CreateFrame("EditBox", nil, optionsFrame, "InputBoxTemplate")
+    optionsFrame.reserveLimitEdit:SetWidth(35)
+    optionsFrame.reserveLimitEdit:SetHeight(22)
+    optionsFrame.reserveLimitEdit:SetPoint("LEFT", optionsFrame.reserveLimitLabel, "RIGHT", 6, 0)
+    optionsFrame.reserveLimitEdit:SetAutoFocus(false)
+    optionsFrame.reserveLimitEdit:SetMaxLetters(2)
+    if optionsFrame.reserveLimitEdit.SetNumeric then optionsFrame.reserveLimitEdit:SetNumeric(true) end
+    local function SaveSoftResLimit()
+        local value = math.floor(tonumber(optionsFrame.reserveLimitEdit:GetText()) or tonumber(AscensionRaidRollsDB.softResLimit) or 2)
+        value = math.max(1, math.min(10, value))
+        AscensionRaidRollsDB.softResLimit = value
+        optionsFrame.reserveLimitEdit:SetText(tostring(value))
+    end
+    optionsFrame.reserveLimitEdit:SetScript("OnEnterPressed", function(self) SaveSoftResLimit(); self:ClearFocus() end)
+    optionsFrame.reserveLimitEdit:SetScript("OnEditFocusLost", SaveSoftResLimit)
+
+    optionsFrame.reserveURLLabel = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.reserveURLLabel:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 30, -224)
+    optionsFrame.reserveURLLabel:SetText("BisBeard URL")
+
+    optionsFrame.reserveURLEdit = CreateFrame("EditBox", nil, optionsFrame)
+    optionsFrame.reserveURLEdit:SetWidth(240)
+    optionsFrame.reserveURLEdit:SetHeight(22)
+    optionsFrame.reserveURLEdit:SetPoint("LEFT", optionsFrame.reserveURLLabel, "RIGHT", 8, 0)
+    optionsFrame.reserveURLEdit:SetAutoFocus(false)
+    optionsFrame.reserveURLEdit:SetMaxLetters(200)
+    if optionsFrame.reserveURLEdit.SetFontObject and GameFontHighlightSmall then
+        optionsFrame.reserveURLEdit:SetFontObject(GameFontHighlightSmall)
+    end
+    if optionsFrame.reserveURLEdit.SetTextInsets then
+        optionsFrame.reserveURLEdit:SetTextInsets(6, 6, 0, 0)
+    end
+    optionsFrame.reserveURLEdit:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true,
+        tileSize = 16,
+        edgeSize = 8,
+        insets = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    optionsFrame.reserveURLEdit:SetBackdropColor(0.03, 0.03, 0.03, 0.92)
+    optionsFrame.reserveURLEdit:SetBackdropBorderColor(0.45, 0.45, 0.45, 1.0)
+    local function SaveSoftResURL()
+        AscensionRaidRollsDB.softResURL = Trim(optionsFrame.reserveURLEdit:GetText() or "") or ""
+        optionsFrame.reserveURLEdit:SetText(AscensionRaidRollsDB.softResURL)
+    end
+    optionsFrame.reserveURLEdit:SetScript("OnEnterPressed", function(self) SaveSoftResURL(); self:ClearFocus() end)
+    optionsFrame.reserveURLEdit:SetScript("OnEditFocusLost", SaveSoftResURL)
+
+    optionsFrame.reserveImportButton = CreateFrame("Button", nil, optionsFrame, "UIPanelButtonTemplate")
+    optionsFrame.reserveImportButton:SetWidth(145)
+    optionsFrame.reserveImportButton:SetHeight(22)
+    optionsFrame.reserveImportButton:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 30, -258)
+    optionsFrame.reserveImportButton:SetText("Import Reservations")
+    optionsFrame.reserveImportButton:SetScript("OnClick", function()
+        AscensionRaidRollsSoftRes.CreateImportFrame():Show()
+    end)
+
+    optionsFrame.reserveCheckButton = CreateFrame("Button", nil, optionsFrame, "UIPanelButtonTemplate")
+    optionsFrame.reserveCheckButton:SetWidth(160)
+    optionsFrame.reserveCheckButton:SetHeight(22)
+    optionsFrame.reserveCheckButton:SetPoint("TOPRIGHT", optionsFrame, "TOPRIGHT", -30, -258)
+    optionsFrame.reserveCheckButton:SetText("Check Raid SoftRes")
+    optionsFrame.reserveCheckButton:SetScript("OnClick", CheckMissingReservations)
+
+    optionsFrame.reserveStatus = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.reserveStatus:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 30, -289)
+    optionsFrame.reserveStatus:SetWidth(330)
+    optionsFrame.reserveStatus:SetJustifyH("LEFT")
+    optionsFrame.reserveStatus:SetText("No reservation list imported.")
+
+    optionsFrame.reserveSeparator = optionsFrame:CreateTexture(nil, "ARTWORK")
+    optionsFrame.reserveSeparator:SetTexture(1, 1, 1, 0.12)
+    optionsFrame.reserveSeparator:SetHeight(1)
+    optionsFrame.reserveSeparator:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 24, -324)
+    optionsFrame.reserveSeparator:SetPoint("TOPRIGHT", optionsFrame, "TOPRIGHT", -24, -324)
+
+    optionsFrame.lootTitle = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    optionsFrame.lootTitle:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 25, -340)
+    optionsFrame.lootTitle:SetText("Automatic Master Loot")
+
+    optionsFrame.masterLooterLabel = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.masterLooterLabel:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 30, -373)
+    optionsFrame.masterLooterLabel:SetText("Recipient")
+
+    optionsFrame.masterLooterEdit = CreateFrame("EditBox", nil, optionsFrame)
+    optionsFrame.masterLooterEdit:SetWidth(125)
+    optionsFrame.masterLooterEdit:SetHeight(22)
+    optionsFrame.masterLooterEdit:SetPoint("LEFT", optionsFrame.masterLooterLabel, "RIGHT", 10, 0)
+    optionsFrame.masterLooterEdit:SetAutoFocus(false)
+    optionsFrame.masterLooterEdit:SetMaxLetters(24)
+    if optionsFrame.masterLooterEdit.SetFontObject and GameFontHighlightSmall then
+        optionsFrame.masterLooterEdit:SetFontObject(GameFontHighlightSmall)
+    end
+    if optionsFrame.masterLooterEdit.SetTextInsets then
+        optionsFrame.masterLooterEdit:SetTextInsets(6, 6, 0, 0)
+    end
+    if optionsFrame.masterLooterEdit.SetBackdrop then
+        optionsFrame.masterLooterEdit:SetBackdrop({
+            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true,
+            tileSize = 16,
+            edgeSize = 8,
+            insets = { left = 2, right = 2, top = 2, bottom = 2 },
+        })
+        optionsFrame.masterLooterEdit:SetBackdropColor(0.03, 0.03, 0.03, 0.90)
+        optionsFrame.masterLooterEdit:SetBackdropBorderColor(0.45, 0.45, 0.45, 1.0)
+    end
+    optionsFrame.masterLooterEdit:SetScript("OnEnterPressed", function(self)
+        SaveMasterLooterSetting()
+        self:ClearFocus()
+    end)
+    optionsFrame.masterLooterEdit:SetScript("OnEditFocusLost", function()
+        SaveMasterLooterSetting()
+    end)
+
+    optionsFrame.autoLootCheck = CreateFrame("CheckButton", nil, optionsFrame, "UICheckButtonTemplate")
+    optionsFrame.autoLootCheck:SetWidth(24)
+    optionsFrame.autoLootCheck:SetHeight(24)
+    optionsFrame.autoLootCheck:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 24, -409)
+    optionsFrame.autoLootCheck:SetScript("OnClick", function(self)
+        SetAutoMasterLootEnabled(self:GetChecked() and true or false)
+    end)
+
+    optionsFrame.autoLootLabel = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.autoLootLabel:SetPoint("LEFT", optionsFrame.autoLootCheck, "RIGHT", 3, 0)
+    optionsFrame.autoLootLabel:SetText("Auto Loot to ML")
+
+    optionsFrame.muteWinnerCheck = CreateFrame("CheckButton", nil, optionsFrame, "UICheckButtonTemplate")
+    optionsFrame.muteWinnerCheck:SetWidth(24)
+    optionsFrame.muteWinnerCheck:SetHeight(24)
+    optionsFrame.muteWinnerCheck:SetPoint("TOPLEFT", optionsFrame, "TOPLEFT", 24, -441)
+    optionsFrame.muteWinnerCheck:SetScript("OnClick", function(self)
+        if IsInRaid() and (not CanControlRolls or not CanControlRolls()) then
+            self:SetChecked(AscensionRaidRollsDB.muteWinnerAnnouncement == true)
+            return
+        end
+        AscensionRaidRollsDB.muteWinnerAnnouncement = self:GetChecked() and true or false
+        Print("winner announcement " .. (AscensionRaidRollsDB.muteWinnerAnnouncement and "muted." or "enabled."))
+    end)
+
+    optionsFrame.muteWinnerLabel = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    optionsFrame.muteWinnerLabel:SetPoint("LEFT", optionsFrame.muteWinnerCheck, "RIGHT", 3, 0)
+    optionsFrame.muteWinnerLabel:SetText("Mute winner /rw announcement")
+
+    -- Keep compatibility with the existing settings/control helpers while the
+    -- actual widgets now live in the dedicated Options frame.
+    mainFrame.masterLooterEdit = optionsFrame.masterLooterEdit
+    mainFrame.masterLooterLabel = optionsFrame.masterLooterLabel
+    mainFrame.autoLootCheck = optionsFrame.autoLootCheck
+    mainFrame.autoLootLabel = optionsFrame.autoLootLabel
+
+    optionsFrame:SetScript("OnShow", function()
+        UpdateOptionsControlState()
+        optionsFrame.masterLooterEdit:SetText(NormalizeMasterLooterSetting(AscensionRaidRollsDB.masterLooter or "@ME"))
+        optionsFrame.autoLootCheck:SetChecked(AscensionRaidRollsDB.autoMasterLoot == true)
+        optionsFrame.muteWinnerCheck:SetChecked(AscensionRaidRollsDB.muteWinnerAnnouncement == true)
+        optionsFrame.reserveModeCheck:SetChecked(AscensionRaidRollsSoftRes.IsPriorityEnabled())
+        optionsFrame.reserveLimitEdit:SetText(tostring(AscensionRaidRollsDB.softResLimit or 2))
+        optionsFrame.reserveURLEdit:SetText(AscensionRaidRollsDB.softResURL or "")
+    end)
+    optionsFrame:Hide()
+end
+
 local function CreateUI()
     mainFrame = CreateFrame("Frame", "AscensionRaidRollsFrame", UIParent)
-    mainFrame:SetWidth(520)
+    mainFrame:SetWidth(600)
     mainFrame:SetHeight(565)
     mainFrame:SetFrameStrata("DIALOG")
     mainFrame:SetClampedToScreen(true)
@@ -3469,84 +4602,31 @@ local function CreateUI()
     end)
     SetButtonEnabled(mainFrame.tieButton, false)
 
-    mainFrame.masterLooterLabel = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    mainFrame.masterLooterLabel:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 24, -136)
-    mainFrame.masterLooterLabel:SetText("Master Looter")
-
-    -- Do not use InputBoxTemplate here. On Ascension's 3.3.5a FrameXML the
-    -- template can leave a detached right-cap texture when this row is laid out
-    -- beside a check button. A plain EditBox with its own backdrop is stable.
-    mainFrame.masterLooterEdit = CreateFrame("EditBox", nil, mainFrame)
-    mainFrame.masterLooterEdit:SetWidth(120)
-    mainFrame.masterLooterEdit:SetHeight(22)
-    mainFrame.masterLooterEdit:SetPoint("LEFT", mainFrame.masterLooterLabel, "RIGHT", 8, 0)
-    mainFrame.masterLooterEdit:SetAutoFocus(false)
-    mainFrame.masterLooterEdit:SetMaxLetters(24)
-    if mainFrame.masterLooterEdit.SetFontObject and GameFontHighlightSmall then
-        mainFrame.masterLooterEdit:SetFontObject(GameFontHighlightSmall)
-    end
-    if mainFrame.masterLooterEdit.SetTextInsets then
-        mainFrame.masterLooterEdit:SetTextInsets(6, 6, 0, 0)
-    end
-    if mainFrame.masterLooterEdit.SetBackdrop then
-        mainFrame.masterLooterEdit:SetBackdrop({
-            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            tile = true,
-            tileSize = 16,
-            edgeSize = 8,
-            insets = { left = 2, right = 2, top = 2, bottom = 2 },
-        })
-        mainFrame.masterLooterEdit:SetBackdropColor(0.03, 0.03, 0.03, 0.90)
-        mainFrame.masterLooterEdit:SetBackdropBorderColor(0.45, 0.45, 0.45, 1.0)
-    end
-    mainFrame.masterLooterEdit:SetText(NormalizeMasterLooterSetting(AscensionRaidRollsDB.masterLooter or "@ME"))
-    mainFrame.masterLooterEdit:SetScript("OnEnterPressed", function(self)
-        SaveMasterLooterSetting()
-        self:ClearFocus()
-    end)
-    mainFrame.masterLooterEdit:SetScript("OnEditFocusLost", function()
-        SaveMasterLooterSetting()
-    end)
-    mainFrame.masterLooterEdit:SetScript("OnEnter", function(self)
-        if GameTooltip then
-            GameTooltip:SetOwner(self, "ANCHOR_TOP")
-            GameTooltip:SetText("Automatic loot recipient")
-            GameTooltip:AddLine("Use @ME for yourself, or enter another raid member's name.", 1, 1, 1, true)
-            GameTooltip:Show()
-        end
-    end)
-    mainFrame.masterLooterEdit:SetScript("OnLeave", function()
-        if GameTooltip then
-            GameTooltip:Hide()
+    mainFrame.optionsButton = CreateFrame("Button", nil, mainFrame, "UIPanelButtonTemplate")
+    mainFrame.optionsButton:SetWidth(92)
+    mainFrame.optionsButton:SetHeight(22)
+    mainFrame.optionsButton:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 24, -132)
+    mainFrame.optionsButton:SetText("Options")
+    mainFrame.optionsButton:SetScript("OnClick", function()
+        if optionsFrame:IsShown() then
+            optionsFrame:Hide()
+        else
+            optionsFrame:Show()
         end
     end)
 
-    mainFrame.autoLootCheck = CreateFrame("CheckButton", nil, mainFrame, "UICheckButtonTemplate")
-    mainFrame.autoLootCheck:SetWidth(24)
-    mainFrame.autoLootCheck:SetHeight(24)
-    mainFrame.autoLootCheck:SetPoint("LEFT", mainFrame.masterLooterEdit, "RIGHT", 12, 0)
-    mainFrame.autoLootCheck:SetChecked(AscensionRaidRollsDB.autoMasterLoot == true)
-    mainFrame.autoLootCheck:SetScript("OnClick", function(self)
-        SetAutoMasterLootEnabled(self:GetChecked() and true or false)
-    end)
-    mainFrame.autoLootCheck:SetScript("OnEnter", function(self)
-        if GameTooltip then
-            GameTooltip:SetOwner(self, "ANCHOR_TOP")
-            GameTooltip:SetText("Auto Loot to ML")
-            GameTooltip:AddLine("When you are the active Master Looter, assigns eligible loot to the configured recipient automatically.", 1, 1, 1, true)
-            GameTooltip:Show()
-        end
-    end)
-    mainFrame.autoLootCheck:SetScript("OnLeave", function()
-        if GameTooltip then
-            GameTooltip:Hide()
+    mainFrame.timersButton = CreateFrame("Button", nil, mainFrame, "UIPanelButtonTemplate")
+    mainFrame.timersButton:SetWidth(92)
+    mainFrame.timersButton:SetHeight(22)
+    mainFrame.timersButton:SetPoint("LEFT", mainFrame.optionsButton, "RIGHT", 6, 0)
+    mainFrame.timersButton:SetText("Timers")
+    mainFrame.timersButton:SetScript("OnClick", function()
+        if AscensionRaidRolls.TradeTimers and AscensionRaidRolls.TradeTimers.Toggle then
+            AscensionRaidRolls.TradeTimers.Toggle()
         end
     end)
 
-    mainFrame.autoLootLabel = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    mainFrame.autoLootLabel:SetPoint("LEFT", mainFrame.autoLootCheck, "RIGHT", 2, 0)
-    mainFrame.autoLootLabel:SetText("Auto Loot to ML")
+    CreateOptionsFrame()
 
     mainFrame.msCount = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     mainFrame.msCount:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 24, -163)
@@ -3554,12 +4634,12 @@ local function CreateUI()
     mainFrame.msCount:SetText("MS  (1-100)")
 
     mainFrame.osCount = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    mainFrame.osCount:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 276, -163)
+    mainFrame.osCount:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 316, -163)
     mainFrame.osCount:SetTextColor(0.35, 0.72, 1.0)
     mainFrame.osCount:SetText("OS  (1-99)")
 
     msPanel = CreateRollPanel(mainFrame, "TOPLEFT", 18)
-    osPanel = CreateRollPanel(mainFrame, "TOPLEFT", 270)
+    osPanel = CreateRollPanel(mainFrame, "TOPLEFT", 310)
 
     mainFrame.separator = mainFrame:CreateTexture(nil, "ARTWORK")
     mainFrame.separator:SetTexture(1, 1, 1, 0.08)
@@ -3575,7 +4655,7 @@ local function CreateUI()
 
     -- Keep the four footer action buttons uniform and use the full width.
     -- Tie Break now lives directly under Start Roll.
-    local footerButtonWidth = 116
+    local footerButtonWidth = 135
     local footerButtonHeight = 24
     local footerButtonGap = 6
 
@@ -3719,6 +4799,14 @@ local function HandleSlashCommand(message)
     elseif lower == "version" or lower == "ver" then
         Print("version " .. tostring(ADDON_VERSION) .. ". Latest version seen from other ARR users this session: " .. tostring(latestSeenVersion) .. ".")
         BroadcastVersion()
+    elseif lower == "options" then
+        if optionsFrame:IsShown() then
+            optionsFrame:Hide()
+        else
+            optionsFrame:Show()
+        end
+    elseif lower == "lootreset" then
+        ClearLootHistory()
     elseif lower == "debug" then
         Print("RANDOM_ROLL_RESULT = " .. tostring(RANDOM_ROLL_RESULT))
         Print("pattern = " .. tostring(rollPattern))
@@ -3750,7 +4838,7 @@ local function HandleSlashCommand(message)
             Print("selected = none")
         end
     else
-        Print("commands: /rr, /rr show, /rr hide, /rr roll, /rr ms, /rr os, /rr clear, /rr test, /rr start, /rr duration <sec>, /rr announce, /rr tie, /rr trade, /rr ml <@ME|player>, /rr autoloot <on|off>, /rr version, /rr debug")
+        Print("commands: /rr, /rr show, /rr hide, /rr options, /rr ms, /rr os, /rr clear, /rr lootreset, /rr test, /rr start, /rr duration <sec>, /rr announce, /rr tie, /rr trade, /rr ml <@ME|player>, /rr autoloot <on|off>, /rr version, /rr debug")
     end
 end
 
@@ -3783,6 +4871,37 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         if AscensionRaidRollsDB.autoMasterLoot == nil then
             AscensionRaidRollsDB.autoMasterLoot = false
         end
+        if AscensionRaidRollsDB.muteWinnerAnnouncement == nil then
+            AscensionRaidRollsDB.muteWinnerAnnouncement = false
+        end
+        if AscensionRaidRollsDB.msosPlusOneEnabled == nil then
+            AscensionRaidRollsDB.msosPlusOneEnabled = false
+        end
+        if AscensionRaidRollsDB.reservePriorityEnabled == nil then
+            AscensionRaidRollsDB.reservePriorityEnabled = false
+        end
+        if AscensionRaidRollsDB.softResLimit == nil then
+            AscensionRaidRollsDB.softResLimit = 2
+        end
+        if AscensionRaidRollsDB.softResURL == nil then
+            AscensionRaidRollsDB.softResURL = ""
+        end
+        if type(AscensionRaidRollsDB.reserveData) ~= "table" then
+            AscensionRaidRollsDB.reserveData = { metadata = {}, roster = {}, byItem = {}, hardItems = {} }
+        end
+        if type(AscensionRaidRollsDB.lootHistory) ~= "table" then
+            AscensionRaidRollsDB.lootHistory = { MS = {}, OS = {} }
+        elseif type(AscensionRaidRollsDB.lootHistory.MS) ~= "table" or type(AscensionRaidRollsDB.lootHistory.OS) ~= "table" then
+            local legacyHistory = AscensionRaidRollsDB.lootHistory
+            local migratedHistory = { MS = {}, OS = {} }
+            local playerKey, count
+            for playerKey, count in pairs(legacyHistory) do
+                if type(count) == "number" and count > 0 then
+                    migratedHistory.MS[playerKey] = count
+                end
+            end
+            AscensionRaidRollsDB.lootHistory = migratedHistory
+        end
 
         -- Some 3.3.5-derived clients expose prefix registration while others
         -- deliver CHAT_MSG_ADDON without it. Use it when available only.
@@ -3795,6 +4914,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         CreateUI()
         CreateMinimapButton()
         InstallBagItemShortcut()
+        AscensionRaidRollsSoftRes.InstallTooltipHooks()
         UpdateControlState()
 
         SLASH_ASCENSIONRAIDROLLS1 = "/rr"
@@ -3895,3 +5015,4 @@ eventFrame:SetScript("OnUpdate", function(self, elapsed)
         UpdateAutoMasterLoot(elapsed)
     end
 end)
+    rollType = rollType == "OS" and "OS" or "MS"

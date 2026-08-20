@@ -9,7 +9,7 @@
 
 ## Normal baseline
 
-- `main` is the normal stable branch. The current normal baseline is v1.7.4.
+- `main` is the normal stable branch. The current normal baseline is v1.8.0.
 - Never copy, merge, or reintroduce the Yigi/troll feature into normal development or releases.
 - Do not redesign or rewrite functioning systems merely for style. Prefer the smallest targeted change.
 
@@ -41,4 +41,3 @@
 - Use clear conventional commits. Push only when appropriate and never use the Yigi branch as a source.
 - Before committing: check Lua syntax where tooling permits, review 3.3.5a API compatibility, inspect taint risks, verify version consistency, and summarize the diff.
 - Test in Project Ascension on Vol'jin when behavior changes; static checks cannot replace in-game validation.
-

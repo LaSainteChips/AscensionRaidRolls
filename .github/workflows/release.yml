@@ -21,7 +21,8 @@ jobs:
           set -euo pipefail
           tag_version="${GITHUB_REF_NAME#v}"
           grep -Fxq "## Version: ${tag_version}" AscensionRaidRolls/AscensionRaidRolls.toc
-          test -f AscensionRaidRolls/AscensionRaidRolls.lua
+          grep -Fq "or \"${tag_version}\"" AscensionRaidRolls/Core/Runtime.lua
+          test -f AscensionRaidRolls/Core/Runtime.lua
 
       - name: Build addon ZIP
         shell: bash
@@ -29,11 +30,11 @@ jobs:
           set -euo pipefail
           archive="AscensionRaidRolls-${GITHUB_REF_NAME}.zip"
           zip -r "$archive" AscensionRaidRolls \
-            -x "AscensionRaidRolls/README.txt"
+            -x "AscensionRaidRolls/README.txt" \
+               "AscensionRaidRolls/ARCHITECTURE.md"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: AscensionRaidRolls-${{ github.ref_name }}.zip
-          generate_release_notes: true
-
+          body_path: RELEASE_NOTES.md

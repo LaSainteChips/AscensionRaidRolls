@@ -1,14 +1,42 @@
-Ascension Raid Rolls - Version 1.7.4
+Ascension Raid Rolls - Version 1.8.0
 
-AscensionRaidRolls v1.7.4
+AscensionRaidRolls v1.8.0
 =========================
 Designed for Project Ascension / WoW client 3.3.5a.
 
-NEW IN 1.7.4 - VERSION NOTIFICATIONS
---------------------------------------
-- Exchanges installed versions with other ARR users through addon messages.
-- Warns when a newer semantic version is observed in the raid or guild.
-- Adds /rr version to show the installed and newest observed versions.
+NEW IN 1.8.0 - SR, MS/OS+1, OPTIONS, AND TRADE TIMERS
+------------------------------------------------------
+- Temporarily tradeable raid loot is listed in a movable expiration-timer window.
+- Timer bars are green above 60 minutes, yellow from 20 to 60, and red at 20 minutes or less.
+- A one-time alert is shown only if the item is still in the current Master Looter's own bags when it reaches 20 minutes.
+- Viewer-held items never send timer alerts back to the Master Looter.
+- Hover a timer row to display the complete item tooltip.
+- Shift + Right-click a timer row to select that item in the roll window.
+- The compact timer window has a fixed width so progress ratios remain stable.
+- Use the Timers button beside Options, or /rrtimers, to hide or reopen the window.
+- Paste a BisBeard Base64 export in Options and press "Import Reservations".
+- Enable "Use SR > MS > OS priority" to mark and prioritize valid SR rollers.
+- Repeated reservations of the same item allow matching valid rolls, shown as 1xSR, 2xSR, etc.; the following roll is a reroll.
+- Item tooltips list each reserving player as "Name - XxSR".
+- Hard-reserved items are detected and cannot start a roll.
+- Configure "SR allowed" in Options (1-10, default 2).
+- Paste the current reservation page into the "BisBeard URL" field.
+- "Check Raid SoftRes" compares the live raid roster with the imported export.
+- It separately announces players absent from the export and players below the configured SR allowance.
+- When the check finds a problem, a /rw invitation includes the configured reservation URL.
+- The Master Looter synchronizes the active mode and current-item SR/HR state to viewers.
+- Open the new Options window from the main Raid Rolls window.
+- Enable "MS/OS+1 loot history" to show +X beside participants.
+- MS and OS use separate counters; each row displays and edits its own roll type.
+- Trade credits the counter matching the selected winner's MS or OS roll.
+- The Master Looter's setting and +X history are synchronized to raid viewers.
+- Viewer history controls are disabled while the player is in a raid.
+- Trade credits up to Top X unique winners for the current roll session.
+- Once Top X is full, trading a new winner replaces the most recently credited winner.
+- The small -/+ buttons beside valid rolls let the Master Looter correct mistakes manually.
+- Loot history persists across reloads until "Clear Loot History" is pressed.
+- Master Looter recipient and Auto Loot to ML settings now live in Options.
+- "Mute winner /rw announcement" suppresses only the Trade winner announcement.
 
 
 
